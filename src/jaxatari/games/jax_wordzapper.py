@@ -897,6 +897,49 @@ class JaxWordZapper(JaxEnvironment[WordZapperState, WordZapperObservation, WordZ
                 (new_enemy_positions, new_enemy_active, new_enemy_global_spawn_timer, state.rng_key)
             )
 
+                       # Player rectangle
+            player_pos = jnp.array([new_player_x, new_player_y])
+            player_size = jnp.array(PLAYER_SIZE)
+
+            # Enemy rectangles and actives
+            enemy_pos = positions[:, 0:2]  # shape (MAX_ENEMIES, 2)
+            enemy_size = jnp.array([16, 16])
+            enemy_active = active
+
+            # Calculate edges for player
+            p_left = player_pos[0]
+            p_right = player_pos[0] + player_size[0]
+            p_top = player_pos[1]
+            p_bottom = player_pos[1] + player_size[1]
+
+            # Calculate edges for all enemies
+            e_left = enemy_pos[:, 0]
+            e_right = enemy_pos[:, 0] + enemy_size[0]
+            e_top = enemy_pos[:, 1]
+            e_bottom = enemy_pos[:, 1] + enemy_size[1]
+
+            # Check overlap for all enemies
+            horizontal_overlaps = (p_left < e_right) & (p_right > e_left)
+            vertical_overlaps = (p_top < e_bottom) & (p_bottom > e_top)
+            collisions = horizontal_overlaps & vertical_overlaps & (enemy_active == 1)
+
+            # If any collision, move player by 13 in direction of enemy (positions[:,3])
+            any_collision = jnp.any(collisions)
+
+            # Find the first colliding enemy (lowest index)
+            colliding_idx = jnp.argmax(collisions)
+
+            # Only use the direction if there is a collision
+            enemy_dir = jnp.where(any_collision, positions[colliding_idx, 3], 0.0)
+
+            # Move player by 13 in direction of enemy_dir
+            new_player_x = jnp.where(any_collision & (enemy_dir < 0), new_player_x - 13, new_player_x)
+            new_player_x = jnp.where(any_collision & (enemy_dir > 0), new_player_x + 13, new_player_x)
+            
+            # Deactivate ("disappear") collided enemy
+            new_enemy_active = jnp.where(collisions, 0, active)
+            # Update state
+
             new_state = state._replace(
                 player_x=new_player_x,
                 player_y=new_player_y,
@@ -904,7 +947,7 @@ class JaxWordZapper(JaxEnvironment[WordZapperState, WordZapperObservation, WordZ
                 player_missile_position=player_missile_position,
                 player_zapper_position=player_zapper_position,
                 enemy_positions=positions,
-                enemy_active=active,
+                enemy_active=new_enemy_active,
                 enemy_global_spawn_timer=global_timer,
                 step_counter=new_step_counter,
                 rng_key=rng_key,
