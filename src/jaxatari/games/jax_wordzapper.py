@@ -897,7 +897,7 @@ class JaxWordZapper(JaxEnvironment[WordZapperState, WordZapperObservation, WordZ
                 (new_enemy_positions, new_enemy_active, new_enemy_global_spawn_timer, state.rng_key)
             )
 
-                       # Player rectangle
+            # Player rectangle
             player_pos = jnp.array([new_player_x, new_player_y])
             player_size = jnp.array(PLAYER_SIZE)
 
