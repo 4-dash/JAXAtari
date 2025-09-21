@@ -165,6 +165,7 @@ class WordZapperState(NamedTuple):
     game_phase: chex.Array  # 0 -> game start, show word, player can't move
                             # 1 -> gameplay
                             # 2 -> player return back animation, player can't move
+                            # 3 -> celebration, player can't move
     phase_timer: chex.Array    
 
     timer: chex.Array
@@ -181,6 +182,11 @@ class WordZapperState(NamedTuple):
     waiting_for_special: chex.Array  # 1 once all letters collected; then require shooting special
 
     finised_level_count: chex.Array 
+    # Animation for post-word-completion
+    word_complete_animation: chex.Array  # 0: off, 1: animating
+    word_complete_anim_frame: chex.Array # frame counter for animation
+    word_complete_anim_origin: chex.Array # original x position to return to
+    word_complete_anim_stage: chex.Array # 0: off, 1: celebration, 2: move to start, 3: done
 
 class EntityPosition(NamedTuple):
     x: jnp.ndarray
@@ -908,8 +914,8 @@ class JaxWordZapper(JaxEnvironment[WordZapperState, WordZapperObservation, WordZ
         letters_y = jnp.full((27,), 30)
 
         reset_state = WordZapperState(
-            player_x=jnp.array(self.consts.PLAYER_START_X),
-            player_y=jnp.array(self.consts.PLAYER_START_Y),
+            player_x=jnp.array(self.consts.PLAYER_START_X, dtype=jnp.float32),
+            player_y=jnp.array(self.consts.PLAYER_START_Y, dtype=jnp.float32),
             player_speed=jnp.array(0),
             player_direction=jnp.array(0),
 
@@ -951,6 +957,10 @@ class JaxWordZapper(JaxEnvironment[WordZapperState, WordZapperObservation, WordZ
             rng_key=next_key,
             score=jnp.array(0),
             finised_level_count=jnp.array(0),
+            word_complete_animation=jnp.array(0),
+            word_complete_anim_frame=jnp.array(0),
+            word_complete_anim_origin=jnp.array(self.consts.PLAYER_START_X, dtype=jnp.float32),
+            word_complete_anim_stage=jnp.array(0),
         )
 
         initial_obs = self._get_observation(reset_state)
@@ -1101,7 +1111,10 @@ class JaxWordZapper(JaxEnvironment[WordZapperState, WordZapperObservation, WordZ
                 lambda: jax.lax.cond(timer >= self.consts.LEVEL_PAUSE_FRAMES, to_game, stay),
                 # 1: gameplay stays
                 stay,
-                # 2: animation
+                # 2: animation stays (handled elsewhere)
+                stay,
+                # 3: celebration, player can't move
+                stay,
             ],
         )
 
@@ -1190,10 +1203,29 @@ class JaxWordZapper(JaxEnvironment[WordZapperState, WordZapperObservation, WordZ
             state.step_counter + 1
         )
 
+        # Timer and letters are paused if in animation phase (game_phase==2)
+        animating = (state.game_phase == 2)
         new_timer = jnp.where(
-            (new_step_counter % 60 == 0) & (state.timer > 0),
-            state.timer - 1,
+            animating,
             state.timer,
+            jnp.where(
+                (new_step_counter % 60 == 0) & (state.timer > 0),
+                state.timer - 1,
+                state.timer,
+            ),
+        )
+        (
+            new_letters_x,
+            new_letters_alive,
+            new_letter_explosion_frame,
+            new_letter_explosion_timer,
+            new_letter_explosion_frame_timer,
+            new_letter_explosion_pos,
+        ) = jax.lax.cond(
+            animating,
+            lambda _: (state.letters_x, state.letters_alive, state.letter_explosion_frame, state.letter_explosion_timer, state.letter_explosion_frame_timer, state.letter_explosion_pos),
+            lambda _: scrolling_letters(state, self.consts),
+            operand=None
         )
 
         new_enemy_positions = state.enemy_positions.at[:, 0].add(
@@ -1319,24 +1351,14 @@ class JaxWordZapper(JaxEnvironment[WordZapperState, WordZapperObservation, WordZ
         # Word length & special-gate logic
         word_len = jnp.sum(target_word >= 0).astype(jnp.int32)
         now_waiting_for_special = (new_current_letter_index >= word_len).astype(jnp.int32)
-
         special_idx = jnp.array(self.consts.SPECIAL_CHAR_INDEX, dtype=jnp.int32)
         special_was_zapped = jnp.any(
             zapped_letters & (state.letters_char == special_idx)
         ).astype(jnp.int32)
-
-        level_cleared = ((now_waiting_for_special & special_was_zapped) & allow_progress).astype(jnp.int32)
-
-        
-        # Advance/carry phase-related state (start -> play -> animation)
+        level_cleared = ((now_waiting_for_special & special_was_zapped) & (new_timer > 0)).astype(jnp.int32)
         phase, p_timer = self._advance_phase(state)
-
-        new_finised_level_count = jnp.where(
-            level_cleared,
-            state.finised_level_count + 1,
-            state.finised_level_count
-        )
-
+        # If word just completed, start animation phase
+        just_completed = (level_cleared == 1) & (state.word_complete_animation == 0) & (state.game_phase == 1)
         updated_state = state._replace(
             player_x=new_player_x,
             player_y=new_player_y,
@@ -1361,19 +1383,116 @@ class JaxWordZapper(JaxEnvironment[WordZapperState, WordZapperObservation, WordZ
             letter_explosion_pos=new_letter_explosion_pos,
             current_letter_index=new_current_letter_index,
             waiting_for_special=now_waiting_for_special,
-            game_phase=phase,
-            phase_timer=p_timer,
-            finised_level_count=new_finised_level_count
+            game_phase=jnp.where(just_completed, 2, phase),
+            phase_timer=jnp.where(just_completed, 0, p_timer),
+            word_complete_animation=jnp.where(just_completed, 1, state.word_complete_animation),
+            word_complete_anim_frame=jnp.where(just_completed, 0, state.word_complete_anim_frame),
+            word_complete_anim_origin=jnp.where(just_completed, new_player_x.astype(jnp.float32), state.word_complete_anim_origin),
+            word_complete_anim_stage=jnp.where(just_completed, 1, state.word_complete_anim_stage),
         )
-
-        # if level cleared and it is not final level move to next level
+        # Animation phase logic (multi-stage)
+        def do_anim_phase(s):
+            cheer_cycles = 2  # number of left/right oscillations
+            osc_frames = 90   # frames per oscillation (slower)
+            total_cheer_frames = cheer_cycles * osc_frames
+            # Oscillate nearly from edge to edge, centered
+            min_x = self.consts.X_BOUNDS[0]
+            max_x = self.consts.X_BOUNDS[1]
+            center_x = (min_x + max_x) / 2
+            osc_amplitude = (max_x - min_x) / 2 - 2  # -2 for margin
+            move_frames = 120  # even slower, smooth return
+            frame = s.word_complete_anim_frame
+            origin = s.word_complete_anim_origin.astype(jnp.float32)
+            stage = s.word_complete_anim_stage
+            # Stage 1: celebration (multiple slow oscillations)
+            def celebration(s):
+                t = (s.word_complete_anim_frame.astype(jnp.float32) / osc_frames)  # progress in current cycle
+                dx = jnp.sin(2 * jnp.pi * t) * osc_amplitude
+                new_x = center_x + dx
+                new_y = s.player_y.astype(jnp.float32)
+                next_frame = s.word_complete_anim_frame + 1
+                next_stage = jnp.where(next_frame >= total_cheer_frames, 2, 1)
+                return s._replace(
+                    player_x=new_x,
+                    player_y=new_y,
+                    word_complete_anim_frame=next_frame,
+                    word_complete_anim_stage=next_stage,
+                )
+            # Stage 2: smooth move to start (using smoothstep)
+            def move_to_start(s):
+                t = (s.word_complete_anim_frame - total_cheer_frames).astype(jnp.float32) / move_frames
+                t = jnp.clip(t, 0, 1)
+                # Smoothstep interpolation for extra smoothness
+                t_smooth = t * t * (3 - 2 * t)
+                start_x = self.consts.PLAYER_START_X
+                start_y = self.consts.PLAYER_START_Y
+                new_x = (1 - t_smooth) * s.player_x.astype(jnp.float32) + t_smooth * jnp.array(start_x, dtype=jnp.float32)
+                new_y = (1 - t_smooth) * s.player_y.astype(jnp.float32) + t_smooth * jnp.array(start_y, dtype=jnp.float32)
+                next_frame = s.word_complete_anim_frame + 1
+                done = next_frame >= (total_cheer_frames + move_frames)
+                next_stage = jnp.where(done, 3, 2)
+                return s._replace(
+                    player_x=new_x,
+                    player_y=new_y,
+                    word_complete_anim_frame=next_frame,
+                    word_complete_anim_stage=next_stage,
+                )
+            # Stage 3: done, resume game (reset timer/letters as at game start)
+            def finish(s):
+                # Only now reset letters to visible positions, after zapper is at starting pos
+                # --- next_level logic ---
+                next_lvl_word_len = s.level_word_len + 1
+                tw, rng2 = choose_target_word(s.rng_key, next_lvl_word_len)
+                letters_x = jnp.linspace(self.consts.LETTER_VISIBLE_MIN_X, self.consts.LETTERS_END, 27)
+                letters_y = jnp.full((27,), 30)
+                letters_positions = jnp.stack([letters_x, letters_y], axis=1)
+                letters_alive = jnp.stack([
+                    jnp.ones((27,), dtype=jnp.int32),
+                    jnp.zeros((27,), dtype=jnp.int32)
+                ], axis=1)
+                return s._replace(
+                    player_x=jnp.array(self.consts.PLAYER_START_X, dtype=jnp.float32),
+                    player_y=jnp.array(self.consts.PLAYER_START_Y, dtype=jnp.float32),
+                    word_complete_animation=0,
+                    word_complete_anim_frame=0,
+                    word_complete_anim_stage=0,
+                    game_phase=jnp.array(0, dtype=jnp.int32),
+                    phase_timer=jnp.array(0, dtype=jnp.int32),
+                    letters_x=letters_x,
+                    letters_y=letters_y,
+                    letters_positions=letters_positions,
+                    letters_alive=letters_alive,
+                    level_word_len=next_lvl_word_len,
+                    target_word=tw,
+                    current_letter_index=jnp.array(0, dtype=jnp.int32),
+                    waiting_for_special=jnp.array(0, dtype=jnp.int32),
+                    rng_key=rng2,
+                )
+            s2 = jax.lax.switch(
+                stage - 1,
+                [celebration, move_to_start, finish],
+                s
+            )
+            return s2
         out_state = jax.lax.cond(
-            jnp.logical_and(level_cleared == 1, state.finised_level_count != 3),
-            self.next_level,
+            updated_state.game_phase == 2,
+            do_anim_phase,
             lambda s: s,
             updated_state
         )
-
+        # Only increment finised_level_count and trigger next_level after animation is fully done
+        out_state = jax.lax.cond(
+            (state.game_phase == 2) & (out_state.game_phase == 1) & (out_state.word_complete_animation == 0),
+            lambda s: s._replace(finised_level_count=s.finised_level_count + 1),
+            lambda s: s,
+            out_state
+        )
+        out_state = jax.lax.cond(
+            (out_state.finised_level_count > state.finised_level_count) & (out_state.finised_level_count != 3),
+            self.next_level,
+            lambda s: s,
+            out_state
+        )
         return out_state
 
     @partial(jax.jit, static_argnums=(0,))
@@ -1673,6 +1792,8 @@ class WordZapperRenderer(JAXGameRenderer):
 
             carry0 = (raster, start)
 
+           
+
             def body_fn(i, carry):
                 ras, x = carry
                 show_letter = (i < current_letter_index) & (i < word_len)
@@ -1698,6 +1819,7 @@ class WordZapperRenderer(JAXGameRenderer):
 
         raster = jax.lax.switch(
             state.game_phase,
+           
             [ 
                 lambda ras: _draw_word(ras, state.target_word), 
                 lambda ras: _draw_progress_word_fixed6(ras, state.target_word, state.current_letter_index),
