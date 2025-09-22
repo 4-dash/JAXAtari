@@ -953,7 +953,6 @@ class JaxWordZapper(JaxEnvironment[WordZapperState, WordZapperObservation, WordZ
         reset_state = WordZapperState(
             player_x=jnp.array(self.consts.PLAYER_START_X, dtype=jnp.int32),
             player_y=jnp.array(self.consts.PLAYER_START_Y, dtype=jnp.int32),
-            player_speed=jnp.array(0),
             player_direction=jnp.array(0),
 
             enemy_positions=jnp.zeros((self.consts.MAX_ENEMIES, 5), dtype=jnp.float32),
